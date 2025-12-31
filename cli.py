@@ -8,13 +8,18 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import numpy as np
 from art.estimators.classification import PyTorchClassifier
-from art.attacks.evasion import FastGradientMethod
+from art.attacks.evasion import FastGradientMethod, ProjectedGradientDescent
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report
 
 from models.mnist_cnn import MNISTCNN
 from defenses.anomaly_detector import AnomalyDetector
 from defenses.robustness_wrapper import RobustnessWrapper
+from utils.metrics import (
+    plot_confusion_matrix,
+    plot_roc_curve,
+    calculate_attack_success_rate,
+)
 
 
 def get_device():
@@ -59,14 +64,15 @@ def train_model(epochs=5):
 
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(train_loader):.4f}")
 
-    # Save model
     Path("models").mkdir(exist_ok=True)
     torch.save(model.state_dict(), "models/mnist_cnn.pt")
     print("Model saved to models/mnist_cnn.pt")
 
 
-def generate_attacks(eps=0.3):
-    print(f"Generating adversarial examples with epsilon={eps}...")
+def generate_attacks(eps=0.3, attack_type="fgsm"):
+    print(
+        f"Generating {attack_type.upper()} adversarial examples with epsilon={eps}..."
+    )
     device = torch.device("cpu")
 
     model = MNISTCNN()
@@ -94,7 +100,15 @@ def generate_attacks(eps=0.3):
         device_type="cpu",
     )
 
-    attack = FastGradientMethod(estimator=classifier, eps=eps)
+    if attack_type == "fgsm":
+        attack = FastGradientMethod(estimator=classifier, eps=eps)
+    elif attack_type == "pgd":
+        attack = ProjectedGradientDescent(
+            estimator=classifier, eps=eps, eps_step=0.01, max_iter=40
+        )
+    else:
+        print(f"Error: Unknown attack type '{attack_type}'")
+        return
 
     x_test, y_test = next(iter(test_loader))
     x_test_np = x_test.numpy()
@@ -103,20 +117,20 @@ def generate_attacks(eps=0.3):
     x_adv = attack.generate(x=x_test_np)
 
     Path("data/processed").mkdir(parents=True, exist_ok=True)
-    np.save("data/processed/x_adv_fgsm.npy", x_adv)
-    np.save("data/processed/y_adv_fgsm.npy", y_test.numpy())
+    np.save(f"data/processed/x_adv_{attack_type}.npy", x_adv)
+    np.save(f"data/processed/y_adv_{attack_type}.npy", y_test.numpy())
     print(f"Saved {len(x_adv)} adversarial examples to data/processed/")
 
 
-def evaluate_defense():
-    print("Evaluating defense mechanism...")
+def evaluate_defense(attack_type="fgsm"):
+    print(f"Evaluating defense mechanism against {attack_type.upper()}...")
 
     try:
-        x_adv = np.load("data/processed/x_adv_fgsm.npy")
-        y_adv = np.load("data/processed/y_adv_fgsm.npy")
+        x_adv = np.load(f"data/processed/x_adv_{attack_type}.npy")
+        y_adv = np.load(f"data/processed/y_adv_{attack_type}.npy")
     except FileNotFoundError:
         print(
-            "Error: Adversarial data not found. Please run 'python cli.py attack' first."
+            f"Error: Adversarial data for {attack_type} not found. Please run 'python cli.py attack --type {attack_type}' first."
         )
         return
 
@@ -131,8 +145,25 @@ def evaluate_defense():
     n = min(len(x_clean), len(x_adv))
     x_clean = x_clean[:n]
     x_adv = x_adv[:n]
+    y_clean = y_clean[:n]
 
-    print(f"Training anomaly detector on {n} clean and {n} adversarial samples...")
+    print("\nCalculating Attack Success Rate...")
+
+    device = torch.device("cpu")
+    model = MNISTCNN()
+    try:
+        model.load_state_dict(torch.load("models/mnist_cnn.pt", map_location=device))
+        model.eval()
+        clean_acc, adv_acc, asr = calculate_attack_success_rate(
+            model, x_clean, x_adv, y_clean
+        )
+        print(f"Clean Accuracy: {clean_acc:.4f}")
+        print(f"Adversarial Accuracy: {adv_acc:.4f}")
+        print(f"Attack Success Rate: {asr:.4f}")
+    except Exception as e:
+        print(f"Could not calculate ASR: {e}")
+
+    print(f"\nTraining anomaly detector on {n} clean and {n} adversarial samples...")
 
     detector = AnomalyDetector()
     detector.fit(x_clean, x_adv)
@@ -142,8 +173,28 @@ def evaluate_defense():
 
     y_pred = detector.predict(x_test)
 
+    try:
+        features = detector.extract_features(x_test)
+        y_scores = detector.pipeline.predict_proba(features)[:, 1]
+
+        print("\nPlotting ROC Curve...")
+        roc_auc = plot_roc_curve(
+            y_test, y_scores, save_path=f"results/roc_curve_{attack_type}.png"
+        )
+        print(f"ROC AUC: {roc_auc:.4f}")
+    except Exception as e:
+        print(f"Could not plot ROC curve: {e}")
+
     print("\nClassification Report for Anomaly Detector:")
     print(classification_report(y_test, y_pred, target_names=["Clean", "Adversarial"]))
+
+    print("\nPlotting Confusion Matrix...")
+    plot_confusion_matrix(
+        y_test,
+        y_pred,
+        classes=["Clean", "Adversarial"],
+        save_path=f"results/confusion_matrix_{attack_type}.png",
+    )
 
     Path("defenses").mkdir(exist_ok=True)
     detector.save("defenses/anomaly_detector.joblib")
@@ -161,19 +212,33 @@ def main():
         "attack", help="Generate adversarial examples"
     )
     attack_parser.add_argument(
-        "--eps", type=float, default=0.3, help="Epsilon for FGSM"
+        "--eps", type=float, default=0.3, help="Epsilon for FGSM/PGD"
+    )
+    attack_parser.add_argument(
+        "--type",
+        type=str,
+        default="fgsm",
+        choices=["fgsm", "pgd"],
+        help="Type of attack (fgsm or pgd)",
     )
 
     defend_parser = subparsers.add_parser("defend", help="Train and evaluate defense")
+    defend_parser.add_argument(
+        "--type",
+        type=str,
+        default="fgsm",
+        choices=["fgsm", "pgd"],
+        help="Type of attack to defend against",
+    )
 
     args = parser.parse_args()
 
     if args.command == "train":
         train_model(args.epochs)
     elif args.command == "attack":
-        generate_attacks(args.eps)
+        generate_attacks(args.eps, args.type)
     elif args.command == "defend":
-        evaluate_defense()
+        evaluate_defense(args.type)
     else:
         parser.print_help()
 
